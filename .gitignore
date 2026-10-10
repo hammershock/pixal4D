@@ -24,3 +24,12 @@ env/
 Thumbs.db
 
 tmp
+
+# Private research and generated runtime artifacts
+/.research/
+/outputs/
+/weights/
+/checkpoints/
+*.safetensors
+*.pt
+*.pth
