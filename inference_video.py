@@ -1,6 +1,7 @@
 """Generate a mesh animation from masked frames using a causal Pixal3D adapter."""
 import argparse
 import json
+import math
 from pathlib import Path
 
 
@@ -8,6 +9,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--frames', type=Path, required=True, help='Directory of ordered, equally framed RGBA PNGs')
     parser.add_argument('--cameras', type=Path, required=True, help='JSON camera object or one object per frame')
+    timing = parser.add_mutually_exclusive_group(required=True)
+    timing.add_argument('--timestamps', type=Path, help='JSON array of actual frame timestamps in seconds')
+    timing.add_argument('--fps', type=float, help='Effective FPS of the supplied, uniformly sampled frames')
     parser.add_argument('--adapters', type=Path, help='Directory containing adapter config.json and safetensors')
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--model', default='TencentARC/Pixal3D')
@@ -33,6 +37,14 @@ def main():
     paths = sorted(args.frames.glob('*.png'))
     if not paths:
         parser.error('No PNG frames found')
+    if args.fps is not None and (not math.isfinite(args.fps) or args.fps <= 0):
+        parser.error('--fps must be finite and positive')
+    timestamps = json.loads(args.timestamps.read_text()) if args.timestamps else [i / args.fps for i in range(len(paths))]
+    from pixal4d.temporal import relative_timestamps
+    try:
+        relative_timestamps(timestamps, [True] * len(paths))
+    except (ValueError, TypeError) as error:
+        parser.error(str(error))
     config = json.loads((args.adapters / 'config.json').read_text()) if args.adapters else {}
     if args.adapters and (not isinstance(config.get('stages'), dict) or not config['stages']):
         parser.error('Adapter config needs a nonempty stages mapping')
@@ -81,7 +93,7 @@ def main():
         options['image_cond_model_' + stage] = feature
     native = Pixal3DImageTo3DPipeline(**options)
     native.to('cuda')
-    # The manifest selects stages explicitly, retaining older two-stage bundles.
+    # The manifest selects the active stages of a continuous-time bundle.
     video = Pixal4DVideoPipeline(native, max_frames=maximum, adapter_config=config.get('adapter'),
                                 stages=config['stages'] if args.adapters else None)
     if args.adapters:
@@ -92,7 +104,7 @@ def main():
     args.output.mkdir(parents=True, exist_ok=True)
     def progress(stage, index, total):
         print(f'{stage}: {index}/{total}', flush=True)
-    outputs = video.run(images, cameras, seed=args.seed, preprocess_image=False,
+    outputs = video.run(images, cameras, timestamps=timestamps, seed=args.seed, preprocess_image=False,
                         progress=progress, return_latent=True, pipeline_type='1024_cascade',
                         sparse_structure_sampler_params={'steps': args.steps},
                         shape_slat_sampler_params={'steps': args.steps},
@@ -111,7 +123,7 @@ def main():
                                      [0, 1, 0, 0], [0, 0, 0, 1]]))
         filename = f'{index:04d}.glb'
         glb.export(args.output / filename)
-        frames.append({'index': index, 'source': paths[index].name, 'mesh': filename})
+        frames.append({'index': index, 'timestamp': timestamps[index], 'source': paths[index].name, 'mesh': filename})
         print(f'exported: {index + 1}/{len(outputs)}', flush=True)
     (args.output / 'animation.json').write_text(json.dumps({'seed': args.seed, 'frames': frames,
         'temporal_stages': list(video.flows),

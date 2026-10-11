@@ -3,7 +3,7 @@ from contextlib import ExitStack
 
 import torch
 
-from .temporal import CausalFlowStream, CausalVideoFlow
+from .temporal import CausalFlowStream, CausalVideoFlow, relative_timestamps
 
 
 class Pixal4DVideoPipeline:
@@ -34,10 +34,12 @@ class Pixal4DVideoPipeline:
         """Load a stage's temporal adapter tensors; base weights stay untouched."""
         if stage not in self.flows:
             raise ValueError(f'Unsupported temporal stage: {stage}')
+        if any(key.endswith('.time.weight') for key in state_dict):
+            raise ValueError('Frame-index adapters are incompatible with continuous time; retrain the adapters')
         self.flows[stage].adapters.load_state_dict(state_dict, strict=True)
 
     @torch.no_grad()
-    def run(self, images, camera_params, *, seed=42, valid_frames=None,
+    def run(self, images, camera_params, *, timestamps, seed=42, valid_frames=None,
             progress=None, **native_options):
         length = len(images)
         if not 1 <= length <= self.max_frames:
@@ -50,6 +52,7 @@ class Pixal4DVideoPipeline:
             valid_frames = valid_frames.tolist()
         if len(valid_frames) != length or any(type(v) is not bool for v in valid_frames):
             raise ValueError('Frame padding mask must match the video length')
+        times = relative_timestamps(timestamps, valid_frames)
         if isinstance(camera_params, dict):
             camera_params = [camera_params] * length
         if len(camera_params) != length:
@@ -71,7 +74,7 @@ class Pixal4DVideoPipeline:
                 progress('generating', index, length)
             with ExitStack() as stack:
                 for stream in streams.values():
-                    stack.enter_context(stream.frame(index))
+                    stack.enter_context(stream.frame(index, times[index]))
                 # Native run resets its RNG. Repeated inputs thus reproduce the
                 # same complete native PBR asset at zero adapter initialization.
                 asset = self.pipeline.run(images[index], camera_params[index], seed=seed, **native_options)
