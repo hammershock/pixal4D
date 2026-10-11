@@ -1,5 +1,7 @@
 # Pixal4D
 
+> **Deprecated branch (2026-10-12).** The temporal-adapter development route is retained for reproducibility only. Small-set experiments improved geometry accuracy but did not pass our temporal-consistency review. New development continues on [`pixal4d/continuous-motion`](https://github.com/hammershock/pixal4D/tree/pixal4d/continuous-motion), starting from native Pixal3D with reusable evaluation and explicit continuous-time motion primitives. The descriptions below document the retired implementation, not the current development plan. Last experimental code: `1f73da4`.
+
 A minimal inference extension of Pixal3D for causal mesh sequences. It supports zero-initialized temporal residuals in all four generation flows: sparse structure, 512 geometry, 1024 geometry, and 1024 PBR material. The native per-frame geometry and material decoders remain unchanged. Mesh topology may change between frames. Maximum sequence length is 16 frames; the Python API supports frame padding masks. High-resolution temporal adapters currently support `1024_cascade` only.
 
 Follow the upstream installation instructions below, then run from this checkout:
