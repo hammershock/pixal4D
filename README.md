@@ -1,3 +1,77 @@
+# Pixal4D
+
+Continuous-time motion primitives built alongside frozen Pixal3D. Native single-image generation remains unchanged. This branch preserves per-frame detailed geometry and sparse features as inputs to future motion estimation.
+
+**Current scope:** validated PyTorch building blocks for sparse velocity queries, bidirectional integration and fixed-connectivity mesh transport. There is **no trained video-to-motion checkpoint, learned iterative refiner, multi-frame surface consolidation or temporally consistent PBR pipeline yet**. The retired temporal-adapter implementation is preserved on [`pixal4d/development`](https://github.com/hammershock/pixal4D/tree/pixal4d/development) and tag `archive/temporal-adapters-20261012`; its weights are not compatible with this representation.
+
+## Continuous-time primitives
+
+The `pixal4d` package requires only PyTorch; importing it does not load Pixal3D, CUDA extensions or model weights. For native image-to-asset inference, follow the unchanged upstream installation below.
+
+```python
+import torch
+from pixal4d import SparseVelocityField, advect
+
+nodes = torch.cartesian_prod(*(torch.arange(2) for _ in range(3)))
+velocity = torch.zeros(2, len(nodes), 3)
+velocity[..., 0] = 0.1  # shared spatial units per second
+field = SparseVelocityField(
+    [0.0, 1.0], nodes, velocity, grid_shape=(2, 2, 2),
+    origin=(-1.0, -1.0, -1.0), spacing=2.0,
+)
+points = torch.tensor([[0.0, 0.0, 0.0]])
+later = advect(field, points, 0.0, 0.5)  # [[0.05, 0.0, 0.0]]
+```
+
+`SparseVelocityField` stores `[F,M,3]` velocity coefficients on a shared sparse set of grid **nodes**, interpolates trilinearly in space and linearly in actual seconds, and rejects time extrapolation or missing spatial support. Irregular timestamps are supported. The support must include the motion's swept region and interpolation neighbors, not only occupied voxels in one frame. This physical velocity is unrelated to the base model's flow-matching denoising velocity. `advect` uses differentiable midpoint RK2, with a maximum step in seconds and subdivisions at observation times. Reverse integration uses the same field and negative time steps; numerical inversion and collision avoidance are not guaranteed.
+
+To preserve native proposals, call the existing pipeline with `return_latent=True`, then use `FrameProposal.from_native(time_seconds, meshes[0], shape_slat, latent_grid_resolution=resolution // 16, coordinate_system="shared_object")`. This wrapper keeps the native mesh and features and converts SLat **cell** indices to centers in `[-0.5,0.5]^3`; it does not normalize latent values, infer correspondence or align cameras. `validate_sequence(proposals)` accepts ordered real frames with different token counts and mesh connectivity, but requires a declared shared coordinate system, device and feature width. Remove padding before constructing the sequence. Per-frame recentering or scale changes must be resolved explicitly.
+
+`MeshTrajectory(vertices, faces, reference_time_seconds, field).vertices_at(time_seconds)` transports one supplied reference mesh while keeping its faces fixed. The caller must provide consolidated reference geometry and a velocity field. This primitive alone does not fuse independent meshes, solve topology changes or generate materials; it is not an end-to-end reconstruction claim.
+
+## Evaluate saved predictions
+
+```bash
+pip install -r requirements-eval.txt
+python evaluate.py --csv path/to/evaluation.csv --output outputs/eval --save-previews
+# Geometry only: CPU, no model checkpoints, PyTorch or renderer required
+python evaluate.py --csv path/to/evaluation.csv --output outputs/geometry --metrics geometry --device cpu
+# Externally rendered RGB pairs, with matching camera, lighting and canvas
+python evaluate.py --csv path/to/evaluation.csv --output outputs/rgb --metrics rgb --device cpu
+```
+
+`evaluate.py` is the only evaluation entry. Defaults are `--metrics geometry pixel`, 100,000 surface samples, F-score thresholds `0.01 0.02`, seed 42, and CUDA normal rendering through the upstream nvdiffrast installation. Pixel/RGB metrics use pretrained AlexNet LPIPS v0.1; the first use may download its backbone into the standard PyTorch cache (`TORCH_HOME` can select an existing cache). `--skip-lpips` explicitly omits that metric. Evaluation does not load Pixal3D or temporal checkpoints. Use a new output directory for each run.
+
+The CSV contains **one row per matching frame/view**, with paths relative to the CSV, or absolute paths. See [example manifest](examples/evaluation.csv); replace its placeholder mesh paths before running. No dataset-specific directory convention is assumed.
+
+| Column | Meaning |
+| --- | --- |
+| `sequence_id,frame_id,timestamp` | Required sequence, frame identifier and time in seconds. Both meshes/images must represent this time; frame indices are never implicitly zipped. Multiple views may share a frame. |
+| `pred_mesh,gt_mesh` | Required for geometry/pixel metrics. Static triangle meshes (e.g. GLB/PLY/OBJ), or NPZ with `vertices,faces`. Animated containers must first be exported at each timestamp. GLB scene-instance transforms are applied. |
+| `reference_length` | Required for geometry: positive reference length in the common coordinate units, fixed across the sequence. Use 1 for a unit-cube-side protocol, or supply the GT sequence bounding-box diagonal. It scales distances/thresholds only; meshes are never recentered or rescaled automatically. |
+| `view_id,view_type,camera` | Pixel metrics require a named view, `input` or `novel`, and a camera JSON. Input and novel views are reported separately. |
+| `pred_transform,gt_transform` | Optional JSON files containing affine 4×4 matrices, applied after scene transforms. Each transform must stay fixed over a sequence. Empty means identity; no ICP or fitted registration is performed. |
+| `pred_rgb,gt_rgb` | Required only with `--metrics rgb` (also requires `view_id,view_type`). Matching saved RGB/RGBA images. No resize, crop or exposure matching; alpha composites onto white. RGB evaluates the whole canvas, so keep object framing/background fixed. |
+
+Camera JSON uses **OpenCV coordinates** (x right, y down, z forward), `K` in pixels, and a rigid `world_to_camera` transform, plus integer `width,height`; optional `near,far` default to 0.001 and 100. See [camera example](examples/evaluation_camera.json). It must describe the meshes **after** the supplied transforms, and the original image canvas. The example camera looks toward the origin from +z in native mesh coordinates. Record any exporter axis conversion in the explicit transform columns; apply it exactly once. When prediction and GT are already in the same native frame, leave both transform columns empty. For square inputs set `fx=fy=width/(2*tan(camera_angle_x/2))`, `cx=width/2`, `cy=height/2`, and camera z translation to `distance*mesh_scale`. Do not reuse these conventions for unrelated exporters.
+
+| Metric family | Output and interpretation |
+| --- | --- |
+| Whole-surface geometry | `cd_l1` ↓: half-sum of mean bidirectional nearest-sample Euclidean distances divided by `reference_length`. `cd_l2` ↓ uses squared normalized distances. `fscore@0.01`, `fscore@0.02` ↑ use those fractions of the reference length. `normal_consistency` ↑ is symmetric mean absolute nearest-sample normal cosine, insensitive to winding flips. Independent area-uniform samples imply nonzero Chamfer even for identical surfaces. |
+| Pixal3D pixel alignment | `mask_iou` ↑, `normal_psnr` ↑, `normal_ssim` ↑, `normal_lpips` ↓, mean/median/boundary normal angular error in degrees ↓, and accuracy below 11.25°/22.5°/30° ↑. `gt_coverage` reports the fraction of the GT silhouette covered by the prediction. These measure geometry, **not material appearance**. |
+| Optional RGB appearance | `rgb_psnr` ↑, `rgb_ssim` ↑, `rgb_lpips` ↓ from supplied rendered pairs. PBR shading/lighting must be matched by the caller; this entry does not infer lighting or automatically render GLB materials. |
+
+Geometry follows the surface-metric conventions in [Occupancy Networks](https://github.com/autonomousvision/occupancy_networks/blob/master/im2mesh/eval.py). Pixel metrics follow [Pixal3D §4.1 / Table 1](https://arxiv.org/html/2605.10922v1#S4.SS1), with the following **explicit local protocol**, not an exact reproduction of its published numbers: flat face-forward camera normals, no antialiasing, encoded as `(normal+1)/2`; PSNR and angular metrics on mask intersection; SSIM with an 11×11 Gaussian window only where the full window is valid; spatial LPIPS averaged on the intersection after both images receive neutral background outside it. `normal_boundary_mean_deg` uses the overlapping part of the inner GT silhouette band (`--boundary-width 3`, 4-connected erosion). Normal-map creases away from the silhouette are not included in that boundary definition. Normal conventions, sampling density, resolution, and background can change the scores. The upstream paper branch uses Direct3D-S2, whereas this fork uses the TRELLIS.2-based branch.
+
+All scores except PSNR/angles/distances use fractions, not percentages. PSNR is capped at 120 dB. Empty overlap/window scores are `null`, never zero error; inspect IoU and coverage alongside them. Invalid/missing files, conflicting timestamps, duplicate frame/view rows, and GT entirely outside the camera fail the run. The manifest explicitly declares frame correspondence; filenames alone cannot verify it. No silent sample skipping is allowed.
+
+Outputs: `metrics.csv` (one geometry row per frame plus rows per view), `summary.json` (views → frames → sequences → equal-weight dataset mean, valid/total counts, parameters, package versions and input hashes), `progress.json`, and optional `previews/` (GT left, prediction right, numbered by CSV row starting at zero). Geometry is counted once even with multiple views. A complete summary is written only after all rows succeed. These **per-frame quality metrics do not establish temporal consistency**; do not label their average as a flicker/motion score. A benchmark without GT geometry cannot supply CD or GT-normal metrics; use registered RGB references where available and report that limited scope.
+
+Add `temporal` to `--metrics` for fixed-camera diagnostics: `normal_change_rmse_per_second` and `silhouette_change_rmse_per_second` measure RMSE of `(predicted change − GT change) / Δt`. Normal maps use the same renderer/encoding as above, with white background. Evaluation uses the union of prediction/GT foregrounds at both adjacent times, without optical flow or alignment. Each view must retain the same camera/canvas and have at least two rows in increasing time order. Scores appear under `temporal_input` / `temporal_novel`; intervals receive equal weight (not duration weighting), with the later endpoint as `frame_id`. This is a local diagnostic, not a standard 3D correspondence metric or a pure flicker score: wrong motion and triangulation changes also contribute, while constant reconstruction errors can score zero. Report it alongside geometry accuracy and compare identical timestamps, cameras and resolution.
+
+
+---
+
 
 <div align="center">
 
