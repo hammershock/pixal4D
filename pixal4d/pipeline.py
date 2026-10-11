@@ -9,19 +9,25 @@ from .temporal import CausalFlowStream, CausalVideoFlow
 class Pixal4DVideoPipeline:
     """Extend an initialized Pixal3D pipeline without changing its decoders.
 
-    The default adapters affect sparse structure and coarse geometry. High
-    resolution geometry and PBR material generation retain their native priors.
+    The adapters affect sparse structure, coarse and high-resolution geometry,
+    and PBR material generation. Native per-frame decoders remain unchanged.
     This produces independent meshes per time step; shared topology is not
     assumed. Input masks can be supplied as image alpha channels. Camera
     parameters follow the wrapped pipeline's image-to-3D convention.
     """
-    stages = ('sparse_structure_flow_model', 'shape_slat_flow_model_512')
+    stages = ('sparse_structure_flow_model', 'shape_slat_flow_model_512',
+              'shape_slat_flow_model_1024', 'tex_slat_flow_model_1024')
 
-    def __init__(self, pipeline, max_frames=16, adapter_config=None):
+    def __init__(self, pipeline, max_frames=16, adapter_config=None, stages=None):
         self.pipeline = pipeline
+        selected = tuple(name for name in self.stages if name in pipeline.models) if stages is None else tuple(stages)
+        if not selected or len(set(selected)) != len(selected):
+            raise ValueError('Choose nonempty, unique temporal stages')
+        if any(name not in self.stages or name not in pipeline.models for name in selected):
+            raise ValueError('Temporal stages must name supported models present in the native pipeline')
         config = dict(adapter_config or {})
         config['max_frames'] = max_frames
-        self.flows = {name: CausalVideoFlow(pipeline.models[name], **config) for name in self.stages}
+        self.flows = {name: CausalVideoFlow(pipeline.models[name], **config) for name in selected}
         self.max_frames = max_frames
 
     def load_adapters(self, stage, state_dict):
@@ -50,6 +56,11 @@ class Pixal4DVideoPipeline:
             raise ValueError('Camera parameters must match the video length')
         if native_options.get('num_samples', 1) != 1:
             raise ValueError('Video inference supports one sample per frame')
+        pipeline_type = native_options.get('pipeline_type') or getattr(self.pipeline, 'default_pipeline_type', '1024_cascade')
+        if any(name in self.flows for name in self.stages[2:]) and pipeline_type != '1024_cascade':
+            # Native 1536 sampling can change its grid resolution per frame.
+            # The current temporal spatial coordinates assume the 64^3 grid.
+            raise ValueError('High-resolution geometry/material temporal adapters require 1024_cascade')
         streams = {name: CausalFlowStream(flow) for name, flow in self.flows.items()}
         results = []
         for index, valid in enumerate(valid_frames):
