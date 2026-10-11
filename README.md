@@ -59,6 +59,8 @@ All scores except PSNR/angles/distances use fractions, not percentages. PSNR is 
 
 Outputs: `metrics.csv` (one geometry row per frame plus rows per view), `summary.json` (views → frames → sequences → equal-weight dataset mean, valid/total counts, parameters, package versions and input hashes), `progress.json`, and optional `previews/` (GT left, prediction right, numbered by CSV row starting at zero). Geometry is counted once even with multiple views. A complete summary is written only after all rows succeed. These **per-frame quality metrics do not establish temporal consistency**; do not label their average as a flicker/motion score. A benchmark without GT geometry cannot supply CD or GT-normal metrics; use registered RGB references where available and report that limited scope.
 
+Add `temporal` to `--metrics` for fixed-camera diagnostics: `normal_change_rmse_per_second` and `silhouette_change_rmse_per_second` measure RMSE of `(predicted change − GT change) / Δt`. Normal maps use the same renderer/encoding as above, with white background. Evaluation uses the union of prediction/GT foregrounds at both adjacent times, without optical flow or alignment. Each view must retain the same camera/canvas and have at least two rows in increasing time order. Scores appear under `temporal_input` / `temporal_novel`; intervals receive equal weight (not duration weighting), with the later endpoint as `frame_id`. This is a local diagnostic, not a standard 3D correspondence metric or a pure flicker score: wrong motion and triangulation changes also contribute, while constant reconstruction errors can score zero. Report it alongside geometry accuracy and compare identical timestamps, cameras and resolution.
+
 ---
 
 

@@ -70,17 +70,17 @@ def read_manifest(path, metrics):
     if not rows:
         raise ValueError('Empty evaluation manifest')
     required = {'sequence_id', 'frame_id', 'timestamp'}
-    if set(metrics) & {'geometry', 'pixel'}:
+    if set(metrics) & {'geometry', 'pixel', 'temporal'}:
         required |= {'pred_mesh', 'gt_mesh'}
     if 'geometry' in metrics:
         required.add('reference_length')
-    if set(metrics) & {'pixel', 'rgb'}:
+    if set(metrics) & {'pixel', 'rgb', 'temporal'}:
         required |= {'view_id', 'view_type'}
-    if 'pixel' in metrics:
+    if set(metrics) & {'pixel', 'temporal'}:
         required.add('camera')
     if 'rgb' in metrics:
         required |= {'pred_rgb', 'gt_rgb'}
-    seen, frames, sequences, timestamps = set(), {}, {}, {}
+    seen, frames, sequences, timestamps, temporal_views = set(), {}, {}, {}, {}
     for index, row in enumerate(rows, 2):
         if None in row or any(row.get(key) is None for key in headers):
             raise ValueError(f'CSV row {index}: incorrect number of columns')
@@ -117,9 +117,18 @@ def read_manifest(path, metrics):
         if row['sequence_id'] in sequences and sequences[row['sequence_id']] != signature:
             raise ValueError('Use one fixed reference length and mesh transform pair per sequence')
         sequences[row['sequence_id']] = signature
-        if 'pixel' in metrics:
+        if set(metrics) & {'pixel', 'temporal'}:
             row['camera_data'] = read_camera(row['camera'])
+        if 'temporal' in metrics:
+            view = (row['sequence_id'], row['view_id'])
+            previous = temporal_views.get(view)
+            signature = (row['camera_data'], row['view_type'])
+            if previous and (row['timestamp'] <= previous[0] or signature != previous[1]):
+                raise ValueError('Temporal views require increasing timestamps and a fixed camera/view type')
+            temporal_views[view] = (row['timestamp'], signature, (previous[2] if previous else 0) + 1)
         rows[index - 2] = row
+    if any(value[2] < 2 for value in temporal_views.values()):
+        raise ValueError('Each temporal sequence/view needs at least two observations')
     return rows
 
 
@@ -159,7 +168,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--csv', type=Path, required=True, help='One row per frame/view; paths relative to CSV')
     parser.add_argument('--output', type=Path, required=True, help='A new or empty output directory')
-    parser.add_argument('--metrics', nargs='+', choices=('geometry', 'pixel', 'rgb'), default=['geometry', 'pixel'])
+    parser.add_argument('--metrics', nargs='+', choices=('geometry', 'pixel', 'rgb', 'temporal'), default=['geometry', 'pixel'])
     parser.add_argument('--device', default='cuda')
     parser.add_argument('--samples', type=int, default=100000)
     parser.add_argument('--thresholds', nargs='+', type=float, default=[.01, .02])
@@ -186,12 +195,14 @@ def main():
 
 def run(args, rows, progress):
     renderer = images = None
-    if set(args.metrics) & {'pixel', 'rgb'}:
+    if set(args.metrics) & {'pixel', 'rgb', 'temporal'}:
         from .pixel import ImageMetrics, NormalRenderer, normal_metrics, read_rgb
-        if 'pixel' in args.metrics:
+        if set(args.metrics) & {'pixel', 'temporal'}:
             renderer = NormalRenderer(args.device)
-        images = ImageMetrics(args.device, not args.skip_lpips)
+        if set(args.metrics) & {'pixel', 'rgb'}:
+            images = ImageMetrics(args.device, not args.skip_lpips)
     records, done_geometry, fingerprints = [], set(), {}
+    previous_views = {}
     previous_key, pair = None, None
     for index, row in enumerate(rows):
         key = (row['sequence_id'], row['frame_id'])
@@ -200,7 +211,7 @@ def run(args, rows, progress):
             path = row[column]
             if path is not None and str(path) not in fingerprints:
                 fingerprints[str(path)] = sha256(path)
-        if set(args.metrics) & {'geometry', 'pixel'} and key != previous_key:
+        if set(args.metrics) & {'geometry', 'pixel', 'temporal'} and key != previous_key:
             pair = [load_mesh(row[f'{kind}_mesh'], row[f'{kind}_matrix']) for kind in ('pred', 'gt')]
             previous_key = key
         if 'geometry' in args.metrics and key not in done_geometry:
@@ -209,12 +220,22 @@ def run(args, rows, progress):
             records.append({**metadata, 'scope': 'geometry', 'view_id': '', 'metrics': scores})
             done_geometry.add(key)
         scores = {}
-        if 'pixel' in args.metrics:
+        if set(args.metrics) & {'pixel', 'temporal'}:
             pred, pmask = renderer.render(pair[0], row['camera_data'])
             truth, gmask = renderer.render(pair[1], row['camera_data'])
             if not gmask.any():
                 raise ValueError(f'Ground truth is outside the camera in CSV row {index + 2}')
-            scores.update(normal_metrics(pred, truth, pmask, gmask, images, args.boundary_width))
+            if 'pixel' in args.metrics:
+                scores.update(normal_metrics(pred, truth, pmask, gmask, images, args.boundary_width))
+            if 'temporal' in args.metrics:
+                from .temporal import normal_state, change_metrics
+                view_key = (row['sequence_id'], row['view_id'])
+                current = normal_state(pred, truth, pmask, gmask, row['timestamp'])
+                if view_key in previous_views:
+                    records.append({**metadata, 'scope': 'temporal_' + row['view_type'],
+                                    'view_id': row['view_id'],
+                                    'metrics': change_metrics(previous_views[view_key], current)})
+                previous_views[view_key] = current
             if args.save_previews:
                 from PIL import Image
                 folder = args.output / 'previews'
@@ -256,7 +277,8 @@ def run(args, rows, progress):
                          'Normal metrics follow Pixal3D metric families, not an exact paper-table reproduction.',
                          'Missing overlap/window metrics are null; inspect coverage, never treat them as zero error.',
                          'RGB pairs are externally rendered on a matching canvas/lighting; RGBA uses white background.',
-                         'These are per-frame metrics, not a temporal consistency measure.']}
+                         'Geometry/pixel/RGB metrics are per-frame; their average does not measure temporal consistency.',
+                         'Optional temporal diagnostics compare normal/silhouette changes to GT in a fixed camera, divided by elapsed seconds. Foreground union across both adjacent frames; no flow/alignment. Equal-weight intervals, then views/sequences. Constant errors may score zero; not a 3D correspondence or pure flicker metric.']}
     write_json(args.output / 'summary.json', summary)
     progress['status'] = 'complete'
     write_json(args.output / 'progress.json', progress)
