@@ -126,9 +126,16 @@ def advect(field, points, start_seconds, end_seconds, *, max_step_seconds=.02, m
     for a, b, count in zip(stops, stops[1:], counts):
         if not count:
             continue
-        dt = (b - a) / count
+        direction = 1. if b > a else -1.
         for i in range(count):
-            t = a + i * dt
+            # Keep earlier integration nodes fixed as the query endpoint moves.
+            # Redistributing the whole interval across ceil(duration / step)
+            # nodes introduces a jump whenever that integer changes.
+            t = a + direction * i * max_step_seconds
+            t = min(t, b) if direction > 0 else max(t, b)
+            dt = direction * min(max_step_seconds, abs(b - t))
+            if not dt:
+                continue
             midpoint = x + .5 * dt * query(x, t)
             x = x + dt * query(midpoint, t + .5 * dt)
     query(x, end)  # Also validate final spatial/time support, including zero duration.
