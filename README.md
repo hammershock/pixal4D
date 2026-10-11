@@ -1,6 +1,6 @@
 # Pixal4D
 
-A minimal inference extension of Pixal3D for causal mesh sequences. It adds zero-initialized temporal residuals to sparse-structure and coarse-geometry generation, while retaining the native high-resolution geometry and PBR decoders. Mesh topology may change between frames. Maximum sequence length is 16 frames; the Python API supports frame padding masks.
+A minimal inference extension of Pixal3D for causal mesh sequences. It supports zero-initialized temporal residuals in all four generation flows: sparse structure, 512 geometry, 1024 geometry, and 1024 PBR material. The native per-frame geometry and material decoders remain unchanged. Mesh topology may change between frames. Maximum sequence length is 16 frames; the Python API supports frame padding masks. High-resolution temporal adapters currently support `1024_cascade` only.
 
 Follow the upstream installation instructions below, then run from this checkout:
 
@@ -12,11 +12,11 @@ python inference_video.py --frames path/to/rgba_frames \
 
 Frames must be ordered RGBA PNGs with matching dimensions and common framing. Alpha is the foreground mask. This entry preserves the image canvas and does not crop or register individual frames. Camera metadata uses Pixal3D's projection convention: a JSON object such as `{"camera_angle_x": 0.7, "distance": 2.0, "mesh_scale": 1.0}`, or one object per frame. FOV is in radians; camera values must correspond to the supplied canvas. Camera estimation and world-space trajectory recovery are not part of this entry.
 
-An adapter directory contains `config.json` (`max_frames`, `adapter`, and a `stages` mapping) plus stage-specific safetensors. No general-purpose trained temporal checkpoint is released yet. Omitting `--adapters` runs the zero-initialized baseline, not a trained 4D generator. Identical images and camera parameters with the same seed retain native Pixal3D behavior at initialization.
+An adapter directory contains `config.json` (`max_frames`, `adapter`, and a `stages` mapping) plus stage-specific safetensors. The mapping selects the active flows; existing two-stage bundles remain supported. Accepted keys are `sparse_structure_flow_model`, `shape_slat_flow_model_512`, `shape_slat_flow_model_1024`, and `tex_slat_flow_model_1024`. No general-purpose trained temporal checkpoint is released yet. Omitting `--adapters` initializes all four flows with zero temporal residuals, reproducing native per-frame sampling rather than a learned motion prior. Temporal connectivity alone does not guarantee consistent geometry or materials.
 
 Outputs are per-frame PBR GLBs and `animation.json`, in one native view-aligned coordinate convention. Use `--model` for a local Pixal3D checkpoint directory, `--image-encoder` / `--naf-source` for local DINOv3 / NAF resources, `--steps` to change sampling steps, and `--texture-size` / `--faces` to control GLB export. The upstream image-to-3D entry remains available as `inference.py`.
 
-For an already initialized native pipeline, use `pixal4d.pipeline.Pixal4DVideoPipeline(native_pipeline).run(images, cameras, valid_frames=mask)`. Padding frames return `None` and do not enter temporal attention. Training and evaluation utilities are not included in this fork's new public interface.
+For an already initialized native pipeline, use `pixal4d.pipeline.Pixal4DVideoPipeline(native_pipeline).run(images, cameras, valid_frames=mask)`. Pass `stages=tuple(stage_names)` to the constructor to adapt a subset; otherwise all available supported flows are selected. Padding frames return `None` and do not enter temporal attention. Training and evaluation utilities are not included in this fork's new public interface.
 
 ---
 

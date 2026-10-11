@@ -34,6 +34,10 @@ def main():
     if not paths:
         parser.error('No PNG frames found')
     config = json.loads((args.adapters / 'config.json').read_text()) if args.adapters else {}
+    if args.adapters and (not isinstance(config.get('stages'), dict) or not config['stages']):
+        parser.error('Adapter config needs a nonempty stages mapping')
+    if args.adapters and any(stage not in Pixal4DVideoPipeline.stages for stage in config['stages']):
+        parser.error('Adapter config contains an unsupported temporal stage')
     maximum = config.get('max_frames', 16)
     if len(paths) > maximum:
         parser.error(f'This model supports at most {maximum} frames')
@@ -77,7 +81,9 @@ def main():
         options['image_cond_model_' + stage] = feature
     native = Pixal3DImageTo3DPipeline(**options)
     native.to('cuda')
-    video = Pixal4DVideoPipeline(native, max_frames=maximum, adapter_config=config.get('adapter'))
+    # The manifest selects stages explicitly, retaining older two-stage bundles.
+    video = Pixal4DVideoPipeline(native, max_frames=maximum, adapter_config=config.get('adapter'),
+                                stages=config['stages'] if args.adapters else None)
     if args.adapters:
         for stage, filename in config['stages'].items():
             video.load_adapters(stage, load_file(str(args.adapters / filename)))
@@ -108,6 +114,7 @@ def main():
         frames.append({'index': index, 'source': paths[index].name, 'mesh': filename})
         print(f'exported: {index + 1}/{len(outputs)}', flush=True)
     (args.output / 'animation.json').write_text(json.dumps({'seed': args.seed, 'frames': frames,
+        'temporal_stages': list(video.flows),
         'coordinates': 'native Pixal3D view-aligned coordinates; no per-frame registration'}, indent=2) + '\n')
 
 
